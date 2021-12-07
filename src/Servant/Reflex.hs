@@ -50,7 +50,7 @@ import qualified Data.Text               as T
 import qualified Data.Text.Encoding      as E
 import           GHC.Exts                (Constraint)
 import           GHC.TypeLits            (KnownSymbol, symbolVal)
-import           Servant.API             ((:<|>) (..), (:>), BasicAuth,
+import           Servant.API             ((:<|>) (..), (:>), AuthProtect, BasicAuth,
                                           BasicAuthData, BuildHeadersTo (..),
                                           Capture, Header, Headers (..),
                                           HttpVersion, IsSecure,
@@ -623,3 +623,19 @@ type family HasCookieAuth xs :: Constraint where
 
 class CookieAuthNotEnabled
 
+-- * generalized auth
+
+class AuthClient (auth :: k) where
+  type AuthClientData (auth :: k) :: *
+  mkAuthReq :: Proxy auth -> Dynamic t (AuthClientData auth) -> Req t -> Req t
+
+instance (HasClient t m api tag, Reflex t, AuthClient auth)
+      => HasClient t m (AuthProtect (auth :: k) :> api) tag where
+
+  type Client t m (AuthProtect auth :> api) tag = Dynamic t (AuthClientData auth)
+                                               -> Client t m api tag
+
+  clientWithRouteAndResultHandler Proxy q t req baseurl opts wrap authdata =
+    clientWithRouteAndResultHandler (Proxy :: Proxy api) q t req' baseurl opts wrap
+      where
+        req'    = mkAuthReq (Proxy :: Proxy auth) authdata req
