@@ -33,39 +33,51 @@ module Servant.Reflex
   , toHeaders
   , HasClient
   , Client
+  , AuthClient(..)
   , module Servant.Common.Req
   , module Servant.Common.BaseUrl
   ) where
 
 ------------------------------------------------------------------------------
 import           Control.Applicative
+import           Control.Arrow           ((+++), left)
+import           Data.Bifunctor          (second)
+import qualified Data.ByteString.Lazy    as BSL
 import qualified Data.CaseInsensitive    as CI
+import           Data.Either             (partitionEithers)
 import           Data.Functor.Identity
 import qualified Data.Map                as Map
 import           Data.Monoid             ((<>))
 import           Data.Proxy              (Proxy (..))
 import qualified Data.Set                as Set
+import           Data.SOP                (NP(..), NS(..), (:.:)(..), All, I(..))
+import           Data.SOP.NP             (cpure_NP)
 import           Data.Text               (Text)
 import qualified Data.Text               as T
 import qualified Data.Text.Encoding      as E
 import           GHC.Exts                (Constraint)
 import           GHC.TypeLits            (KnownSymbol, symbolVal)
+import           Network.HTTP.Media      ( MediaType )
+import           Network.HTTP.Types      (Status, mkStatus)
 import           Servant.API             ((:<|>) (..), (:>), AuthProtect, BasicAuth,
                                           BasicAuthData, BuildHeadersTo (..),
-                                          Capture, Header, Headers (..),
+                                          Capture, Header, HasStatus(..), Headers (..),
                                           HttpVersion, IsSecure,
                                           MimeRender (..), MimeUnrender,
                                           NoContent, QueryFlag, QueryParam,
                                           QueryParams, Raw, ReflectMethod (..),
                                           RemoteHost, ReqBody,
-                                          ToHttpApiData (..), Vault, Verb,
-                                          contentType)
+                                          ToHttpApiData (..), Union, UVerb, Vault, Verb,
+                                          contentType, inject, statusOf)
+import           Servant.API.ContentTypes
+                                         (AllMime, AllMimeUnrender, allMimeUnrender)
 import           Servant.API.Description (Summary)
+import           Servant.API.UVerb       (HasStatuses)
 import qualified Servant.Auth            as Auth
 
 import           Reflex.Dom.Core         (Dynamic, Event, Reflex,
                                           XhrRequest (..), XhrResponse (..),
-                                          XhrResponseHeaders (..),
+                                          XhrResponseBody(..), XhrResponseHeaders (..),
                                           attachPromptlyDynWith, constDyn, ffor,
                                           fmapMaybe, leftmost,
                                           performRequestsAsync)
@@ -78,8 +90,7 @@ import           Servant.Common.Req      (ClientOptions(..),
                                           Req, ReqResult(..), QParam(..),
                                           QueryPart(..), addHeader, authData,
                                           defReq, evalResponse, prependToPathParts,
-                                          -- performRequestCT,
-                                          performRequestsCT,
+                                          performRequests, performRequestsCT,
                                           -- performRequestNoBody,
                                           performRequestsNoBody,
                                           performSomeRequestsAsync,
@@ -639,3 +650,77 @@ instance (HasClient t m api tag, Reflex t, AuthClient auth)
     clientWithRouteAndResultHandler (Proxy :: Proxy api) q t req' baseurl opts wrap
       where
         req'    = mkAuthReq (Proxy :: Proxy auth) authdata req
+
+-- * servant-uverb
+
+instance
+  ( SupportsServantReflex t m
+  , ReflectMethod method
+  , AllMime contentTypes
+  , All (AllMimeUnrender contentTypes) as
+  , All HasStatus as
+  , HasStatuses as
+  )
+  => HasClient t m (UVerb method contentTypes as) tag where
+  type Client t m (UVerb method contentTypes as) tag
+    = Event t tag -> m (Event t (ReqResult tag (Union as)))
+  clientWithRouteAndResultHandler
+    :: Proxy layout -- ^ route
+    -> Proxy m -- ^ widget monad
+    -> Proxy tag -- ^ tag
+    -> Req t -- ^ request
+    -> Dynamic t BaseUrl -- ^ base url
+    -> ClientOptions -- ^ opts
+    -> (  forall a
+        . Event t (ReqResult tag a)
+       -> m (Event t (ReqResult tag a))
+       ) -- ^ result handler
+    -> Event t tag -- ^ event
+    -> m (Event t (ReqResult tag (Union as)))
+  clientWithRouteAndResultHandler Proxy Proxy Proxy req dBaseUrl opts resultHandler trigger
+    = do
+      let method = E.decodeUtf8 . reflectMethod $ (Proxy :: Proxy method)
+          dReqs  = constDyn . Identity $ req { reqMethod = method }
+
+      resps :: Event t (tag, Either Text XhrResponse) <-
+        fmap (second runIdentity)
+          <$> performRequests method dReqs dBaseUrl opts trigger
+      resultHandler . ffor resps $ \(t, r) -> case r of
+        Left e -> RequestFailure t e
+        Right (resp :: XhrResponse) ->
+          let status = mkStatus
+                (fromIntegral $ _xhrResponse_status resp)
+                (E.encodeUtf8 $ _xhrResponse_statusText resp)
+              body = case _xhrResponse_response resp of
+                Just (XhrResponseBody_ArrayBuffer bs) -> BSL.fromStrict bs
+                _ -> ""
+              res = tryParsers status $ mimeUnrenders body
+          in  case res of
+                Left  errors -> ResponseFailure t (T.intercalate "," errors) resp
+                Right x      -> ResponseSuccess t x resp
+   where
+    tryParsers
+      :: forall xs
+       . All HasStatus xs
+      => Status
+      -> NP ([] :.: Either (MediaType, String)) xs
+      -> Either [Text] (Union xs)
+    tryParsers _ Nil = Left ["ClientNoMatchingStatus"]
+    tryParsers status (Comp x :* xs)
+      | status == statusOf (Comp x) = case partitionEithers x of
+        (err', []) ->
+          (map (mappend "ClientParseError: " . T.pack . show) err' ++)
+            +++ S
+            $   tryParsers status xs
+        (_, (res : _)) -> Right . inject . I $ res
+      | otherwise = -- no reason to parse in the first place. This ain't the one we're looking for
+                    ("ClientStatusMismatch" :) +++ S $ tryParsers status xs
+    mimeUnrenders
+      :: BSL.ByteString -> NP ([] :.: Either (MediaType, String)) as
+    mimeUnrenders body = cpure_NP
+      (Proxy :: Proxy (AllMimeUnrender contentTypes))
+      ( Comp
+      . map (\(mediaType, parser) -> left ((,) mediaType) (parser body))
+      . allMimeUnrender
+      $ (Proxy :: Proxy contentTypes)
+      )
